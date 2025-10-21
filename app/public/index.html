@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Shopify Customer Finder</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; color: #111; }
+    .card { max-width: 760px; border: 1px solid #e5e7eb; border-radius: 8px; padding: 1.25rem; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+    label { display:block; margin: 0.75rem 0 0.25rem; font-weight: 600; }
+    input[type="text"] { width: 100%; padding: 0.6rem; border: 1px solid #cbd5e1; border-radius: 6px; }
+    .row { display: flex; align-items: center; gap: 0.5rem; }
+    button { background: #111827; color: #fff; border: 0; border-radius: 6px; padding: 0.6rem 1rem; cursor: pointer; }
+    button:disabled { background: #9ca3af; cursor: not-allowed; }
+    .muted { color: #6b7280; font-size: 0.9rem; }
+    .status { margin-top: 0.75rem; }
+    .success { color: #065f46; }
+    .error { color: #991b1b; }
+    .progress { color: #374151; }
+  </style>
+</head>
+<body>
+  <h1>Shopify Customer Finder</h1>
+  <p class="muted">Enter a product category to discover DTC brands, detect Shopify, and export XLSX.</p>
+
+  <div class="card">
+    <label for="category">Product category</label>
+    <input id="category" type="text" placeholder='e.g., "natural deodorant"' />
+
+    <div class="row" style="margin-top: 0.75rem;">
+      <label><input type="checkbox" id="amazon_check" /> Include Amazon presence check</label>
+    </div>
+
+    <div class="row" style="margin-top: 1rem;">
+      <button id="startBtn">Start Job</button>
+      <button id="downloadBtn" disabled>Download XLSX</button>
+    </div>
+
+    <div id="status" class="status muted"></div>
+  </div>
+
+<script>
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('startBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+
+let currentJobId = null;
+let pollHandle = null;
+
+function setStatus(text, cls='muted') {
+  statusEl.className = `status ${cls}`;
+  statusEl.textContent = text;
+}
+
+async function createJob() {
+  const category = document.getElementById('category').value.trim();
+  const include_amazon_check = document.getElementById('amazon_check').checked;
+  if (!category) {
+    setStatus('Please enter a product category.', 'error');
+    return;
+  }
+  startBtn.disabled = true;
+  downloadBtn.disabled = true;
+  setStatus('Submitting job...', 'progress');
+  try {
+    const res = await fetch('/api/jobs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ category, include_amazon_check })
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error(t || 'Failed to create job');
+    }
+    const data = await res.json();
+    currentJobId = data.job_id;
+    setStatus('Job queued. Polling for status...', 'progress');
+    pollHandle = setInterval(pollJob, 1200);
+  } catch (e) {
+    console.error(e);
+    setStatus('Error creating job: ' + (e.message || e), 'error');
+    startBtn.disabled = false;
+  }
+}
+
+async function pollJob() {
+  if (!currentJobId) return;
+  try {
+    const res = await fetch(`/api/jobs/${currentJobId}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.status === 'not_found') {
+      setStatus('Job not found or expired.', 'error');
+      clearInterval(pollHandle);
+      startBtn.disabled = false;
+      return;
+    }
+    if (data.status === 'running' || data.status === 'queued') {
+      setStatus(`Status: ${data.status}. Progress: ${data.progress || 0}%`, 'progress');
+      return;
+    }
+    if (data.status === 'completed') {
+      setStatus('Completed. You can download the XLSX.', 'success');
+      downloadBtn.disabled = false;
+      clearInterval(pollHandle);
+      startBtn.disabled = false;
+      return;
+    }
+    if (data.status === 'failed') {
+      setStatus('Job failed: ' + (data.message || ''), 'error');
+      clearInterval(pollHandle);
+      startBtn.disabled = false;
+      return;
+    }
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+async function downloadResult() {
+  if (!currentJobId) return;
+  try {
+    const res = await fetch(`/api/jobs/${currentJobId}/result`);
+    if (res.status === 409) {
+      setStatus('Job not completed yet.', 'progress');
+      return;
+    }
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error(t || 'Failed to download');
+    }
+    const blob = await res.blob();
+    // Try to parse filename from headers
+    const cd = res.headers.get('Content-Disposition') || '';
+    const match = cd.match(/filename="([^"]+)"/);
+    const filename = match ? match[1] : 'leads.xlsx';
+
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+  } catch (e) {
+    console.error(e);
+    setStatus('Download failed: ' + (e.message || e), 'error');
+  }
+}
+
+startBtn.addEventListener('click', createJob);
+downloadBtn.addEventListener('click', downloadResult);
+</script>
+</body>
+</html>

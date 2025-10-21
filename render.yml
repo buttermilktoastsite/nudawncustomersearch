@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: shopify-customer-finder
+    env: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r app/requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port 10000
+    envVars:
+      - key: FRONTEND_ORIGIN
+        value: "*"
+      - key: REDIS_URL
+        sync: false
+      - key: JOB_TTL_SECONDS
+        value: "3600"
+      - key: SEARCH_ENGINE
+        value: "auto"
+      - key: SERPAPI_KEY
+        sync: false
+      - key: SEARCH_CONCURRENCY
+        value: "4"
+      - key: SEARCH_PAGES_PER_QUERY
+        value: "3"
+      - key: DETECT_CONCURRENCY
+        value: "6"
+      - key: TARGET_LEADS_MIN
+        value: "50"
+      - key: TARGET_LEADS_MAX
+        value: "100"
