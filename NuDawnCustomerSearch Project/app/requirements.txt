@@ -1,7 +1,0 @@
-fastapi
-uvicorn[standard]
-slowapi
-httpx
-openpyxl
-redis[hiredis]
-beautifulsoup4
