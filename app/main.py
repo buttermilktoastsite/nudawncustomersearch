@@ -66,15 +66,21 @@ def _redis_ssl_flag(url: str) -> bool:
     """Enable SSL/TLS only when URL starts with rediss://"""
     return url.strip().lower().startswith("rediss://")
 
-redis = aioredis.StrictRedis.from_url(
-    REDIS_URL,
-    decode_responses=False,
-    ssl=_redis_ssl_flag(REDIS_URL),
-    socket_timeout=15,
-    socket_connect_timeout=15,
-    retry_on_timeout=True,
-    health_check_interval=30,
-)
+# For redis:// (non-TLS), we don't need ssl parameter at all
+redis_kwargs = {
+    "decode_responses": False,
+    "socket_timeout": 15,
+    "socket_connect_timeout": 15,
+    "retry_on_timeout": True,
+    "health_check_interval": 30,
+}
+
+# Only add ssl_cert_reqs if using rediss://
+if _redis_ssl_flag(REDIS_URL):
+    import ssl
+    redis_kwargs["ssl_cert_reqs"] = ssl.CERT_NONE
+
+redis = aioredis.StrictRedis.from_url(REDIS_URL, **redis_kwargs)
 
 # -------- Key helpers --------
 def k_job(job_id: str) -> str:
@@ -603,3 +609,4 @@ async def serve_index():
 
 # Mount static assets at /static
 app.mount("/static", StaticFiles(directory=public_dir, html=False), name="static")
+
