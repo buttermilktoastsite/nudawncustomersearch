@@ -8,7 +8,7 @@ from urllib.parse import urlparse, urlunparse, urlencode, parse_qs, urljoin
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from starlette.staticfiles import StaticFiles
 
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -24,7 +24,7 @@ from redis import asyncio as aioredis
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 AMAZON_CHECK_CONCURRENCY = int(os.getenv("AMAZON_CHECK_CONCURRENCY", "4"))
 AMAZON_CHECK_DELAY_MS = int(os.getenv("AMAZON_CHECK_DELAY_MS", "250"))
-REDIS_URL = os.getenv("REDIS_URL")  # redis://default:<password>@<upstash-host>:6379
+REDIS_URL = os.getenv("REDIS_URL")  # e.g. redis://default:<password>@<host>:6379
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", "3600"))
 
 # Discovery tuning
@@ -54,14 +54,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve static frontend from ./public
-public_dir = os.path.join(os.path.dirname(__file__), "public")
-app.mount("/", StaticFiles(directory=public_dir, html=True), name="static")
-
 # -------- Redis --------
 redis = aioredis.StrictRedis.from_url(REDIS_URL, decode_responses=False)
 
-# Redis keys
+# -------- Key helpers --------
 def k_job(job_id: str) -> str: return f"job:{job_id}"
 def k_job_lock(job_id: str) -> str: return f"job:{job_id}:lock"
 def k_job_file(job_id: str) -> str: return f"job:{job_id}:file"
@@ -96,8 +92,7 @@ def get_hostname(url: str) -> str:
 
 def get_root_domain(url: str) -> str:
     try:
-        hostname = get_hostname(url)
-        hostname = hostname.replace("www.", "")
+        hostname = get_hostname(url).replace("www.", "")
         parts = hostname.split(".")
         if len(parts) >= 2:
             return parts[-2]
@@ -112,7 +107,7 @@ def is_marketplace_url(url: str) -> bool:
     bad_roots = ("amazon.", "walmart.", "target.", "etsy.", "ebay.")
     return host.startswith(bad_roots) or any(f".{b}" in host for b in bad_roots)
 
-# -------- Heuristic signals (cheap) --------
+# -------- Shopify detection (heuristic + precise) --------
 def looks_like_shopify_heuristic(url: str, snippet: str = "") -> bool:
     url_l = url.lower()
     snip_l = (snippet or "").lower()
@@ -124,7 +119,6 @@ def looks_like_shopify_heuristic(url: str, snippet: str = "") -> bool:
         return True
     return False
 
-# -------- Deep Shopify detection (fetch site) --------
 SHOPIFY_JS_PATTERNS = [
     r"window\.Shopify",
     r"ShopifyAnalytics",
@@ -193,7 +187,7 @@ async def precise_shopify_check(base_url: str) -> Optional[bool]:
             if txt is not None:
                 return True
 
-        # Soft probes for ecom paths; not decisive:
+        # soft probes (non-decisive)
         for path in ("cart", "checkout"):
             await fetch_text(client, urljoin(base, path), method="HEAD")
 
@@ -221,7 +215,7 @@ async def check_amazon_presence(brand: str) -> str:
     except:
         return "Unknown"
 
-# -------- Discovery: SerpAPI --------
+# -------- Discovery via SerpAPI or DuckDuckGo --------
 async def search_serpapi(query: str, page: int) -> List[Tuple[str, str, str]]:
     start = (page - 1) * 10
     url = "https://serpapi.com/search.json"
@@ -249,7 +243,6 @@ async def search_serpapi(query: str, page: int) -> List[Tuple[str, str, str]]:
                 out.append((link, title, snippet))
     return out
 
-# -------- Discovery: DuckDuckGo HTML --------
 async def search_duckduckgo(query: str, page: int) -> List[Tuple[str, str, str]]:
     offset = (page - 1) * 30
     params = {"q": query, "kl": "us-en", "s": str(offset)}
@@ -273,7 +266,6 @@ async def search_duckduckgo(query: str, page: int) -> List[Tuple[str, str, str]]
                 results.append((href, title, snippet))
     return results
 
-# -------- Discovery strategy --------
 def build_queries(category: str) -> List[str]:
     base = category.strip()
     q = [
@@ -424,52 +416,6 @@ async def job_release_lock(job_id: str):
     except:
         pass
 
-# -------- Job runner --------
-async def run_job(job_id: str):
-    if not await job_claim_lock(job_id):
-        return
-    try:
-        await job_update(job_id, {"status": "running", "progress": "5", "updated_at": str(now_ms())})
-
-        data = await job_read(job_id)
-        category = data.get("category", "")
-        include_amazon_check = data.get("include_amazon_check", "false") == "true"
-
-        # 1) Discover
-        leads = await discover_leads(category)
-        await job_update(job_id, {"progress": "25", "updated_at": str(now_ms())})
-
-        # 2) Dedupe by root domain
-        deduped = dedupe_by_root_domain(leads)
-        await job_update(job_id, {"progress": "45", "updated_at": str(now_ms())})
-
-        # 3) Precise Shopify detection pass
-        await refine_shopify_detection(deduped)
-        await job_update(job_id, {"progress": "70", "updated_at": str(now_ms())})
-
-        # 4) Optional Amazon check
-        if include_amazon_check:
-            await enrich_amazon_presence(deduped)
-        await job_update(job_id, {"progress": "85", "updated_at": str(now_ms())})
-
-        # 5) Build XLSX and store in Redis
-        buffer = leads_to_xlsx_bytes(deduped[:TARGET_LEADS_MAX])
-        await job_set_file(job_id, buffer)
-
-        await job_update(job_id, {
-            "status": "completed",
-            "progress": "100",
-            "filename": f"leads_{category.replace(' ', '_')}.xlsx",
-            "updated_at": str(now_ms())
-        })
-    except Exception as e:
-        await job_update(job_id, {"status": "failed", "message": str(e), "updated_at": str(now_ms())})
-    finally:
-        await job_release_lock(job_id)
-
-def schedule_job(job_id: str):
-    asyncio.get_event_loop().create_task(run_job(job_id))
-
 # -------- API --------
 @app.post("/api/jobs")
 @limiter.limit("20/minute")
@@ -489,7 +435,7 @@ async def create_job(request: Request):
         "category": category,
         "include_amazon_check": "true" if include else "false"
     })
-    schedule_job(job_id)
+    asyncio.get_event_loop().create_task(run_job(job_id))
     return {"job_id": job_id}
 
 @app.get("/api/jobs/{job_id}")
@@ -520,3 +466,50 @@ async def get_result(job_id: str):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+# -------- Job runner --------
+async def run_job(job_id: str):
+    if not await job_claim_lock(job_id):
+        return
+    try:
+        await job_update(job_id, {"status": "running", "progress": "5", "updated_at": str(now_ms())})
+        data = await job_read(job_id)
+        category = data.get("category", "")
+        include_amazon_check = data.get("include_amazon_check", "false") == "true"
+
+        leads = await discover_leads(category)
+        await job_update(job_id, {"progress": "25", "updated_at": str(now_ms())})
+
+        deduped = dedupe_by_root_domain(leads)
+        await job_update(job_id, {"progress": "45", "updated_at": str(now_ms())})
+
+        await refine_shopify_detection(deduped)
+        await job_update(job_id, {"progress": "70", "updated_at": str(now_ms())})
+
+        if include_amazon_check:
+            await enrich_amazon_presence(deduped)
+        await job_update(job_id, {"progress": "85", "updated_at": str(now_ms())})
+
+        buffer = leads_to_xlsx_bytes(deduped[:TARGET_LEADS_MAX])
+        await job_set_file(job_id, buffer)
+
+        await job_update(job_id, {
+            "status": "completed",
+            "progress": "100",
+            "filename": f"leads_{category.replace(' ', '_')}.xlsx",
+            "updated_at": str(now_ms())
+        })
+    except Exception as e:
+        await job_update(job_id, {"status": "failed", "message": str(e), "updated_at": str(now_ms())})
+    finally:
+        await job_release_lock(job_id)
+
+# -------- Static files (mounted after all API routes) --------
+public_dir = os.path.join(os.path.dirname(__file__), "public")
+
+@app.get("/")
+async def serve_index():
+    return FileResponse(os.path.join(public_dir, "index.html"))
+
+# Serve any additional static assets under /static
+app.mount("/static", StaticFiles(directory=public_dir, html=False), name="static")
