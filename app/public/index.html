@@ -21,7 +21,7 @@
 </head>
 <body>
   <h1>Shopify Customer Finder</h1>
-  <p class="muted">Enter a product category to discover DTC brands, detect Shopify, and export XLSX.</p>
+  <p class="muted">Enter a product category to discover DTC brands, detect Shopify precisely, and export XLSX.</p>
 
   <div class="card">
     <label for="category">Product category</label>
@@ -68,12 +68,16 @@ async function createJob() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ category, include_amazon_check })
     });
+    const text = await res.text();
     if (!res.ok) {
-      const t = await res.text();
-      throw new Error(t || 'Failed to create job');
+      throw new Error(text || 'Failed to create job');
     }
-    const data = await res.json();
+    let data = {};
+    try { data = JSON.parse(text); } catch { data = {}; }
     currentJobId = data.job_id;
+    if (!currentJobId) {
+      throw new Error('No job_id returned from server');
+    }
     setStatus('Job queued. Polling for status...', 'progress');
     pollHandle = setInterval(pollJob, 1200);
   } catch (e) {
@@ -130,7 +134,6 @@ async function downloadResult() {
       throw new Error(t || 'Failed to download');
     }
     const blob = await res.blob();
-    // Try to parse filename from headers
     const cd = res.headers.get('Content-Disposition') || '';
     const match = cd.match(/filename="([^"]+)"/);
     const filename = match ? match[1] : 'leads.xlsx';
