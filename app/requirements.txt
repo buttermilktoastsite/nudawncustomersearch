@@ -3,5 +3,6 @@ uvicorn[standard]
 slowapi
 httpx
 openpyxl
-redis[hiredis]
+redis>=5.0.1
+
 beautifulsoup4
