@@ -62,15 +62,15 @@ app.add_middleware(
 )
 
 # -------- Redis --------
-import ssl
+redis_kwargs = {
+    "decode_responses": False,
+    "socket_timeout": 15,
+    "socket_connect_timeout": 15,
+    "retry_on_timeout": True,
+    "health_check_interval": 30,
+}
 
-redis = aioredis.StrictRedis.from_url(
-    REDIS_URL,
-    decode_responses=False,
-    socket_timeout=15,
-    socket_connect_timeout=15,
-    ssl_cert_reqs=ssl.CERT_NONE if REDIS_URL.startswith("rediss://") else None,
-)
+redis = aioredis.StrictRedis.from_url(REDIS_URL, **redis_kwargs)
 
 # -------- Key helpers --------
 def k_job(job_id: str) -> str:
@@ -111,16 +111,66 @@ def get_hostname(url: str) -> str:
     except:
         return ""
 
-def get_root_domain(url: str) -> str:
-    """Extract root domain for deduplication"""
+def get_parent_url(url: str) -> str:
+    """Extract parent/root URL (scheme + netloc only)"""
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme or "https"
+        netloc = parsed.netloc or ""
+        if netloc:
+            return f"{scheme}://{netloc}"
+        return url
+    except:
+        return url
+
+def get_brand_from_url(url: str) -> str:
+    """Extract brand/company name from URL"""
     try:
         hostname = get_hostname(url).replace("www.", "")
+        # Remove TLD (.com, .co.uk, etc.)
         parts = hostname.split(".")
         if len(parts) >= 2:
-            return parts[-2]
+            # Take the main domain part (e.g., "kilimanjarogear" from "kilimanjarogear.com")
+            brand = parts[-2]
+            # Capitalize first letter
+            return brand.capitalize()
         return hostname
     except:
         return url
+
+def extract_brand_from_title(title: str) -> str:
+    """Extract brand name from page title"""
+    if not title:
+        return ""
+    
+    # Common patterns in titles:
+    # "Product Name | Brand Name"
+    # "Product Name - Brand Name"
+    # "Brand Name: Product Name"
+    # "Product Name – Brand Name"
+    
+    # Try splitting by common separators
+    for sep in [" | ", " - ", " – ", " — ", ":"]:
+        if sep in title:
+            parts = title.split(sep)
+            # Usually brand is the last part or second-to-last
+            if len(parts) >= 2:
+                # Take the last part, clean it up
+                brand = parts[-1].strip()
+                # Remove common suffixes
+                for suffix in ["Shop", "Store", "Official Site", "Official Store", "Online Store"]:
+                    if brand.endswith(suffix):
+                        brand = brand[:-len(suffix)].strip()
+                if brand and len(brand) > 2:
+                    return brand
+    
+    # If no separator, take first few words (likely brand)
+    words = title.split()
+    if len(words) > 0:
+        # Take first 1-3 words as potential brand
+        return " ".join(words[:min(3, len(words))])
+    
+    return ""
 
 def is_marketplace_url(url: str) -> bool:
     """Filter out marketplace URLs"""
@@ -191,9 +241,43 @@ async def fetch_text(client: httpx.AsyncClient, url: str, method: str = "GET") -
     except:
         return None
 
+async def fetch_brand_from_homepage(url: str) -> Optional[str]:
+    """Try to extract brand name from homepage"""
+    try:
+        headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers=headers) as client:
+            r = await client.get(url, follow_redirects=True)
+            if r.status_code != 200:
+                return None
+            
+            soup = BeautifulSoup(r.text, "html.parser")
+            
+            # Try to find brand in common places
+            # 1. Site title
+            title_tag = soup.find("title")
+            if title_tag:
+                title = title_tag.get_text(strip=True)
+                brand = extract_brand_from_title(title)
+                if brand:
+                    return brand
+            
+            # 2. Meta og:site_name
+            og_site = soup.find("meta", property="og:site_name")
+            if og_site and og_site.get("content"):
+                return og_site["content"].strip()
+            
+            # 3. Logo alt text
+            logo = soup.find("img", class_=lambda x: x and "logo" in x.lower())
+            if logo and logo.get("alt"):
+                return logo["alt"].strip()
+            
+            return None
+    except:
+        return None
+
 async def precise_shopify_check(base_url: str) -> Optional[bool]:
     """Multi-method precise Shopify detection"""
-    base = normalize_url(base_url)
+    base = get_parent_url(base_url)
     if not base.startswith("http"):
         base = "https://" + base.lstrip("/")
     if not base.endswith("/"):
@@ -281,30 +365,45 @@ async def search_serpapi(query: str, page: int) -> List[Tuple[str, str, str]]:
     return out
 
 async def search_duckduckgo(query: str, page: int) -> List[Tuple[str, str, str]]:
-    """Search using DuckDuckGo HTML"""
+    """Search using DuckDuckGo HTML with retry logic"""
     offset = (page - 1) * 30
     params = {"q": query, "kl": "us-en", "s": str(offset)}
     url = "https://duckduckgo.com/html"
-    headers = {"User-Agent": USER_AGENT}
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": "https://duckduckgo.com/",
+    }
     results: List[Tuple[str, str, str]] = []
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            r = await client.post(url, data=params, headers=headers)
-            if r.status_code != 200:
-                return results
-            soup = BeautifulSoup(r.text, "html.parser")
-            for result in soup.select("div.result"):
-                a = result.select_one("a.result__a")
-                if not a:
-                    continue
-                href = a.get("href") or ""
-                title = a.get_text(" ", strip=True)
-                snippet_el = result.select_one(".result__snippet")
-                snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
-                if href and href.startswith("http"):
-                    results.append((href, title, snippet))
-    except:
-        pass
+    
+    # Retry up to 3 times with backoff
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+                r = await client.post(url, data=params, headers=headers)
+                if r.status_code == 200:
+                    soup = BeautifulSoup(r.text, "html.parser")
+                    for result in soup.select("div.result"):
+                        a = result.select_one("a.result__a")
+                        if not a:
+                            continue
+                        href = a.get("href") or ""
+                        title = a.get_text(" ", strip=True)
+                        snippet_el = result.select_one(".result__snippet")
+                        snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+                        if href and href.startswith("http"):
+                            results.append((href, title, snippet))
+                    if results:
+                        return results
+                # If we got rate limited or blocked, wait and retry
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)  # 1s, 2s backoff
+        except Exception as e:
+            print(f"DuckDuckGo search error (attempt {attempt + 1}): {e}")
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+    
     return results
 
 def build_queries(category: str) -> List[str]:
@@ -324,7 +423,7 @@ async def discover_leads(category: str) -> List[Dict[str, str]]:
     """Discover leads via search engines"""
     queries = build_queries(category)
     leads: List[Dict[str, str]] = []
-    seen_urls = set()
+    seen_domains = set()  # Track by domain instead of full URL
     sem = asyncio.Semaphore(SEARCH_CONCURRENCY)
 
     use_serpapi = (SEARCH_ENGINE == "serpapi") or (SEARCH_ENGINE == "auto" and SERPAPI_KEY)
@@ -336,7 +435,7 @@ async def discover_leads(category: str) -> List[Dict[str, str]]:
             return await search_duckduckgo(query, page)
 
     async def fetch_query(q: str):
-        nonlocal leads, seen_urls
+        nonlocal leads, seen_domains
         for page in range(1, SEARCH_PAGES_PER_QUERY + 1):
             async with sem:
                 try:
@@ -344,22 +443,36 @@ async def discover_leads(category: str) -> List[Dict[str, str]]:
                     for url, title, snippet in results:
                         if is_marketplace_url(url):
                             continue
-                        nurl = normalize_url(url)
-                        if nurl in seen_urls:
+                        
+                        # Get parent URL (root domain)
+                        parent_url = get_parent_url(url)
+                        domain = get_hostname(parent_url)
+                        
+                        # Skip if we've already seen this domain
+                        if domain in seen_domains:
                             continue
-                        seen_urls.add(nurl)
-                        base_title = title.split(" - ")[0].split(" | ")[0].strip() if title else ""
-                        brand = base_title or get_root_domain(nurl)
-                        shopify_guess = "Yes" if looks_like_shopify_heuristic(nurl, f"{title} {snippet}") else "Unknown"
+                        seen_domains.add(domain)
+                        
+                        # Extract brand name from title first
+                        brand = extract_brand_from_title(title)
+                        
+                        # Fallback to URL-based brand extraction
+                        if not brand or len(brand) < 3:
+                            brand = get_brand_from_url(parent_url)
+                        
+                        shopify_guess = "Yes" if looks_like_shopify_heuristic(url, f"{title} {snippet}") else "Unknown"
+                        
                         leads.append({
-                            "Brand Name": brand or get_root_domain(nurl),
-                            "URL": nurl,
+                            "Brand Name": brand,
+                            "URL": parent_url,
                             "Is this a Shopify site?": shopify_guess,
                             "Already selling on Amazon?": "Unknown",
                         })
+                        
                         if len(leads) >= TARGET_LEADS_MAX:
                             return
-                except Exception:
+                except Exception as e:
+                    print(f"Search error: {e}")
                     pass
             if len(leads) >= TARGET_LEADS_MAX:
                 return
@@ -370,11 +483,12 @@ async def discover_leads(category: str) -> List[Dict[str, str]]:
     return leads[:max(TARGET_LEADS_MIN, min(TARGET_LEADS_MAX, len(leads)))]
 
 def dedupe_by_root_domain(leads: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Deduplicate leads by root domain"""
+    """Deduplicate leads by domain (already using parent URLs)"""
     seen = set()
     out: List[Dict[str, str]] = []
     for lead in leads:
-        domain = get_root_domain(lead.get("URL") or "")
+        url = lead.get("URL") or ""
+        domain = get_hostname(url)
         if not domain:
             continue
         if domain in seen:
@@ -410,6 +524,24 @@ def leads_to_xlsx_bytes(leads: List[Dict[str, str]]) -> bytes:
     wb.save(stream)
     return stream.getvalue()
 
+async def refine_brand_names(leads: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Refine brand names by fetching from homepage"""
+    sem = asyncio.Semaphore(DETECT_CONCURRENCY)
+    
+    async def refine_one(lead):
+        url = lead.get("URL") or ""
+        current_brand = lead.get("Brand Name") or ""
+        
+        # Only refine if current brand looks like a domain name (no spaces)
+        if current_brand and " " not in current_brand:
+            async with sem:
+                better_brand = await fetch_brand_from_homepage(url)
+                if better_brand and len(better_brand) > 2:
+                    lead["Brand Name"] = better_brand
+    
+    await asyncio.gather(*(refine_one(l) for l in leads), return_exceptions=True)
+    return leads
+
 async def refine_shopify_detection(leads: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """Refine Shopify detection with precise checks"""
     sem = asyncio.Semaphore(DETECT_CONCURRENCY)
@@ -434,7 +566,9 @@ async def enrich_amazon_presence(leads: List[Dict[str, str]]):
     sem = asyncio.Semaphore(AMAZON_CHECK_CONCURRENCY)
     
     async def check_one(lead):
-        brand = (lead.get("Brand Name") or "").strip() or get_root_domain(lead.get("URL") or "")
+        brand = (lead.get("Brand Name") or "").strip()
+        if not brand:
+            brand = get_brand_from_url(lead.get("URL") or "")
         async with sem:
             lead["Already selling on Amazon?"] = await check_amazon_presence(brand)
             await sleep_ms(AMAZON_CHECK_DELAY_MS)
@@ -554,11 +688,31 @@ async def run_job(job_id: str):
         include_amazon_check = data.get("include_amazon_check", "false") == "true"
 
         # Step 1: Discover leads
+        print(f"[Job {job_id}] Starting discovery for category: {category}")
         leads = await discover_leads(category)
+        print(f"[Job {job_id}] Found {len(leads)} initial leads")
         await job_update(job_id, {"progress": "25", "updated_at": str(now_ms())})
+
+        if len(leads) == 0:
+            await job_update(job_id, {
+                "status": "completed",
+                "progress": "100",
+                "message": "No leads found. Try using SERPAPI_KEY for better results.",
+                "filename": f"leads_{category.replace(' ', '_')}.xlsx",
+                "updated_at": str(now_ms())
+            })
+            # Still create empty file
+            buffer = leads_to_xlsx_bytes([])
+            await job_set_file(job_id, buffer)
+            return
 
         # Step 2: Deduplicate
         deduped = dedupe_by_root_domain(leads)
+        print(f"[Job {job_id}] After deduplication: {len(deduped)} leads")
+        await job_update(job_id, {"progress": "35", "updated_at": str(now_ms())})
+
+        # Step 2.5: Refine brand names
+        await refine_brand_names(deduped)
         await job_update(job_id, {"progress": "45", "updated_at": str(now_ms())})
 
         # Step 3: Refine Shopify detection
@@ -573,6 +727,7 @@ async def run_job(job_id: str):
         # Step 5: Generate XLSX
         buffer = leads_to_xlsx_bytes(deduped[:TARGET_LEADS_MAX])
         await job_set_file(job_id, buffer)
+        print(f"[Job {job_id}] Generated XLSX with {len(deduped)} leads")
 
         await job_update(job_id, {
             "status": "completed",
@@ -581,6 +736,9 @@ async def run_job(job_id: str):
             "updated_at": str(now_ms())
         })
     except Exception as e:
+        print(f"[Job {job_id}] Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         await job_update(job_id, {
             "status": "failed",
             "message": str(e),
@@ -599,7 +757,3 @@ async def serve_index():
 
 # Mount static assets at /static
 app.mount("/static", StaticFiles(directory=public_dir, html=False), name="static")
-
-
-
-
