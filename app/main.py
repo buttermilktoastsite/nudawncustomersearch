@@ -24,7 +24,7 @@ from redis import asyncio as aioredis
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 AMAZON_CHECK_CONCURRENCY = int(os.getenv("AMAZON_CHECK_CONCURRENCY", "4"))
 AMAZON_CHECK_DELAY_MS = int(os.getenv("AMAZON_CHECK_DELAY_MS", "250"))
-REDIS_URL = os.getenv("REDIS_URL")  # e.g. redis://default:<password>@<host>:6379
+REDIS_URL = os.getenv("REDIS_URL")
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", "3600"))
 
 # Discovery tuning
@@ -36,11 +36,18 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "15.0"))
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (compatible; LeadFinderBot/1.3; +https://example.com/bot)")
 
 # Search engine selection
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")  # optional
-SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "auto").lower()  # "auto" | "serpapi" | "duckduckgo"
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "auto").lower()
+
+# Shopify detection concurrency
+DETECT_CONCURRENCY = int(os.getenv("DETECT_CONCURRENCY", "6"))
 
 if not REDIS_URL:
     raise RuntimeError("Missing REDIS_URL environment variable")
+
+# Validate Redis URL scheme
+if not REDIS_URL.lower().startswith(("redis://", "rediss://", "unix://")):
+    raise RuntimeError("REDIS_URL must start with redis://, rediss://, or unix://")
 
 # -------- App + Middleware --------
 limiter = Limiter(key_func=get_remote_address)
@@ -55,12 +62,29 @@ app.add_middleware(
 )
 
 # -------- Redis --------
-redis = aioredis.StrictRedis.from_url(REDIS_URL, decode_responses=False)
+def _redis_ssl_flag(url: str) -> bool:
+    """Enable SSL/TLS only when URL starts with rediss://"""
+    return url.strip().lower().startswith("rediss://")
+
+redis = aioredis.StrictRedis.from_url(
+    REDIS_URL,
+    decode_responses=False,
+    ssl=_redis_ssl_flag(REDIS_URL),
+    socket_timeout=15,
+    socket_connect_timeout=15,
+    retry_on_timeout=True,
+    health_check_interval=30,
+)
 
 # -------- Key helpers --------
-def k_job(job_id: str) -> str: return f"job:{job_id}"
-def k_job_lock(job_id: str) -> str: return f"job:{job_id}:lock"
-def k_job_file(job_id: str) -> str: return f"job:{job_id}:file"
+def k_job(job_id: str) -> str:
+    return f"job:{job_id}"
+
+def k_job_lock(job_id: str) -> str:
+    return f"job:{job_id}:lock"
+
+def k_job_file(job_id: str) -> str:
+    return f"job:{job_id}:file"
 
 # -------- Utilities --------
 async def sleep_ms(ms: int):
@@ -70,6 +94,7 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 def normalize_url(url: str) -> str:
+    """Remove tracking params and normalize URL"""
     try:
         u = urlparse(url)
         query = parse_qs(u.query)
@@ -91,6 +116,7 @@ def get_hostname(url: str) -> str:
         return ""
 
 def get_root_domain(url: str) -> str:
+    """Extract root domain for deduplication"""
     try:
         hostname = get_hostname(url).replace("www.", "")
         parts = hostname.split(".")
@@ -101,6 +127,7 @@ def get_root_domain(url: str) -> str:
         return url
 
 def is_marketplace_url(url: str) -> bool:
+    """Filter out marketplace URLs"""
     host = get_hostname(url)
     if not host:
         return False
@@ -109,6 +136,7 @@ def is_marketplace_url(url: str) -> bool:
 
 # -------- Shopify detection (heuristic + precise) --------
 def looks_like_shopify_heuristic(url: str, snippet: str = "") -> bool:
+    """Quick heuristic check for Shopify indicators"""
     url_l = url.lower()
     snip_l = (snippet or "").lower()
     if "cdn.shopify.com" in url_l or "cdn.shopify.com" in snip_l:
@@ -136,6 +164,7 @@ SHOPIFY_ASSET_HINTS = [
 ]
 
 def detect_shopify_from_html(html: str) -> bool:
+    """Deep HTML inspection for Shopify markers"""
     if not html:
         return False
     low = html.lower()
@@ -152,6 +181,7 @@ def detect_shopify_from_html(html: str) -> bool:
     return False
 
 async def fetch_text(client: httpx.AsyncClient, url: str, method: str = "GET") -> Optional[str]:
+    """Fetch URL text with error handling"""
     try:
         if method == "HEAD":
             r = await client.head(url, follow_redirects=True)
@@ -166,6 +196,7 @@ async def fetch_text(client: httpx.AsyncClient, url: str, method: str = "GET") -
         return None
 
 async def precise_shopify_check(base_url: str) -> Optional[bool]:
+    """Multi-method precise Shopify detection"""
     base = normalize_url(base_url)
     if not base.startswith("http"):
         base = "https://" + base.lstrip("/")
@@ -173,30 +204,36 @@ async def precise_shopify_check(base_url: str) -> Optional[bool]:
         base = base + "/"
 
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers=headers) as client:
-        robots = await fetch_text(client, urljoin(base, "robots.txt"))
-        if robots and ("shopify" in robots.lower()):
-            return True
-
-        home_html = await fetch_text(client, base)
-        if home_html is not None and detect_shopify_from_html(home_html):
-            return True
-
-        for asset in ("assets/theme.js", "assets/theme.css"):
-            txt = await fetch_text(client, urljoin(base, asset), method="HEAD")
-            if txt is not None:
+    
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers=headers) as client:
+            # Check robots.txt
+            robots = await fetch_text(client, urljoin(base, "robots.txt"))
+            if robots and ("shopify" in robots.lower()):
                 return True
 
-        # soft probes (non-decisive)
-        for path in ("cart", "checkout"):
-            await fetch_text(client, urljoin(base, path), method="HEAD")
+            # Check homepage HTML
+            home_html = await fetch_text(client, base)
+            if home_html is not None and detect_shopify_from_html(home_html):
+                return True
 
-        if home_html is not None:
-            return False
+            # Check theme assets
+            for asset in ("assets/theme.js", "assets/theme.css"):
+                txt = await fetch_text(client, urljoin(base, asset), method="HEAD")
+                if txt is not None:
+                    return True
+
+            # If we got homepage but no Shopify markers, it's likely not Shopify
+            if home_html is not None:
+                return False
+            
+            return None
+    except:
         return None
 
 # -------- Amazon presence check --------
 async def check_amazon_presence(brand: str) -> str:
+    """Check if brand appears on Amazon search"""
     q = brand
     url = f"https://www.amazon.com/s?k={q}"
     headers = {
@@ -217,6 +254,7 @@ async def check_amazon_presence(brand: str) -> str:
 
 # -------- Discovery via SerpAPI or DuckDuckGo --------
 async def search_serpapi(query: str, page: int) -> List[Tuple[str, str, str]]:
+    """Search using SerpAPI"""
     start = (page - 1) * 10
     url = "https://serpapi.com/search.json"
     params = {
@@ -230,43 +268,51 @@ async def search_serpapi(query: str, page: int) -> List[Tuple[str, str, str]]:
     }
     headers = {"User-Agent": USER_AGENT}
     out: List[Tuple[str, str, str]] = []
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.get(url, params=params, headers=headers)
-        if r.status_code != 200:
-            return out
-        data = r.json()
-        for item in (data.get("organic_results") or []):
-            link = item.get("link") or ""
-            title = (item.get("title") or "").strip()
-            snippet = (item.get("snippet") or "").strip()
-            if link:
-                out.append((link, title, snippet))
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            r = await client.get(url, params=params, headers=headers)
+            if r.status_code != 200:
+                return out
+            data = r.json()
+            for item in (data.get("organic_results") or []):
+                link = item.get("link") or ""
+                title = (item.get("title") or "").strip()
+                snippet = (item.get("snippet") or "").strip()
+                if link:
+                    out.append((link, title, snippet))
+    except:
+        pass
     return out
 
 async def search_duckduckgo(query: str, page: int) -> List[Tuple[str, str, str]]:
+    """Search using DuckDuckGo HTML"""
     offset = (page - 1) * 30
     params = {"q": query, "kl": "us-en", "s": str(offset)}
     url = "https://duckduckgo.com/html"
     headers = {"User-Agent": USER_AGENT}
-    results: List[Tuple[str,str,str]] = []
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.post(url, data=params, headers=headers)
-        if r.status_code != 200:
-            return results
-        soup = BeautifulSoup(r.text, "html.parser")
-        for result in soup.select("div.result"):
-            a = result.select_one("a.result__a")
-            if not a:
-                continue
-            href = a.get("href") or ""
-            title = a.get_text(" ", strip=True)
-            snippet_el = result.select_one(".result__snippet")
-            snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
-            if href and href.startswith("http"):
-                results.append((href, title, snippet))
+    results: List[Tuple[str, str, str]] = []
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            r = await client.post(url, data=params, headers=headers)
+            if r.status_code != 200:
+                return results
+            soup = BeautifulSoup(r.text, "html.parser")
+            for result in soup.select("div.result"):
+                a = result.select_one("a.result__a")
+                if not a:
+                    continue
+                href = a.get("href") or ""
+                title = a.get_text(" ", strip=True)
+                snippet_el = result.select_one(".result__snippet")
+                snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+                if href and href.startswith("http"):
+                    results.append((href, title, snippet))
+    except:
+        pass
     return results
 
 def build_queries(category: str) -> List[str]:
+    """Build search queries for lead discovery"""
     base = category.strip()
     q = [
         f'"powered by shopify" "{base}"',
@@ -279,12 +325,14 @@ def build_queries(category: str) -> List[str]:
     return q
 
 async def discover_leads(category: str) -> List[Dict[str, str]]:
+    """Discover leads via search engines"""
     queries = build_queries(category)
     leads: List[Dict[str, str]] = []
     seen_urls = set()
     sem = asyncio.Semaphore(SEARCH_CONCURRENCY)
 
     use_serpapi = (SEARCH_ENGINE == "serpapi") or (SEARCH_ENGINE == "auto" and SERPAPI_KEY)
+    
     async def do_search(query: str, page: int) -> List[Tuple[str, str, str]]:
         if use_serpapi:
             return await search_serpapi(query, page)
@@ -326,6 +374,7 @@ async def discover_leads(category: str) -> List[Dict[str, str]]:
     return leads[:max(TARGET_LEADS_MIN, min(TARGET_LEADS_MAX, len(leads)))]
 
 def dedupe_by_root_domain(leads: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Deduplicate leads by root domain"""
     seen = set()
     out: List[Dict[str, str]] = []
     for lead in leads:
@@ -339,6 +388,7 @@ def dedupe_by_root_domain(leads: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return out
 
 def leads_to_xlsx_bytes(leads: List[Dict[str, str]]) -> bytes:
+    """Convert leads to XLSX bytes"""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Leads"
@@ -356,15 +406,18 @@ def leads_to_xlsx_bytes(leads: List[Dict[str, str]]) -> bytes:
             row.get("Is this a Shopify site?") or "",
             row.get("Already selling on Amazon?") or "Unknown",
         ])
-    ws["A1"].font = openpyxl.styles.Font(bold=True)
+    # Bold headers
+    for cell in ws[1]:
+        cell.font = openpyxl.styles.Font(bold=True)
+    
     stream = io.BytesIO()
     wb.save(stream)
     return stream.getvalue()
 
-DETECT_CONCURRENCY = int(os.getenv("DETECT_CONCURRENCY", "6"))
-
 async def refine_shopify_detection(leads: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Refine Shopify detection with precise checks"""
     sem = asyncio.Semaphore(DETECT_CONCURRENCY)
+    
     async def check_one(lead):
         url = lead.get("URL") or ""
         async with sem:
@@ -376,53 +429,65 @@ async def refine_shopify_detection(leads: List[Dict[str, str]]) -> List[Dict[str
             else:
                 if lead.get("Is this a Shopify site?") not in ("Yes", "No"):
                     lead["Is this a Shopify site?"] = "Unknown"
-    await asyncio.gather(*(check_one(l) for l in leads))
+    
+    await asyncio.gather(*(check_one(l) for l in leads), return_exceptions=True)
     return leads
 
 async def enrich_amazon_presence(leads: List[Dict[str, str]]):
+    """Enrich leads with Amazon presence check"""
     sem = asyncio.Semaphore(AMAZON_CHECK_CONCURRENCY)
+    
     async def check_one(lead):
         brand = (lead.get("Brand Name") or "").strip() or get_root_domain(lead.get("URL") or "")
         async with sem:
             lead["Already selling on Amazon?"] = await check_amazon_presence(brand)
             await sleep_ms(AMAZON_CHECK_DELAY_MS)
-    await asyncio.gather(*(check_one(l) for l in leads))
+    
+    await asyncio.gather(*(check_one(l) for l in leads), return_exceptions=True)
     return leads
 
 # -------- Redis helpers --------
-async def job_update(job_id: str, mapping: Dict[str, str | bytes]):
-    bmap = { (k.encode() if isinstance(k, str) else k): (v.encode() if isinstance(v, str) else v) for k,v in mapping.items() }
+async def job_update(job_id: str, mapping: Dict[str, str]):
+    """Update job metadata in Redis"""
+    bmap = {k.encode(): v.encode() for k, v in mapping.items()}
     await redis.hset(k_job(job_id), mapping=bmap)
     await redis.expire(k_job(job_id), JOB_TTL_SECONDS)
 
 async def job_read(job_id: str) -> Dict[str, str]:
+    """Read job metadata from Redis"""
     data = await redis.hgetall(k_job(job_id))
     if not data:
         return {}
-    return { k.decode(): v.decode() for k, v in data.items() }
+    return {k.decode(): v.decode() for k, v in data.items()}
 
 async def job_set_file(job_id: str, blob: bytes):
+    """Store job result file in Redis"""
     await redis.set(k_job_file(job_id), blob, ex=JOB_TTL_SECONDS)
 
 async def job_get_file(job_id: str) -> Optional[bytes]:
+    """Retrieve job result file from Redis"""
     return await redis.get(k_job_file(job_id))
 
 async def job_claim_lock(job_id: str, ttl: int = 240) -> bool:
+    """Claim a lock for job processing"""
     return await redis.set(k_job_lock(job_id), b"1", ex=ttl, nx=True) is True
 
 async def job_release_lock(job_id: str):
+    """Release job processing lock"""
     try:
         await redis.delete(k_job_lock(job_id))
     except:
         pass
 
-# -------- API --------
+# -------- API Routes --------
 @app.post("/api/jobs")
 @limiter.limit("20/minute")
 async def create_job(request: Request):
+    """Create a new lead discovery job"""
     data = await request.json()
     category = (data.get("category") or "").strip()
     include = bool(data.get("include_amazon_check"))
+    
     if not category:
         raise HTTPException(status_code=400, detail="Missing category")
 
@@ -435,27 +500,35 @@ async def create_job(request: Request):
         "category": category,
         "include_amazon_check": "true" if include else "false"
     })
-    asyncio.get_event_loop().create_task(run_job(job_id))
+    
+    # Start job processing in background
+    asyncio.create_task(run_job(job_id))
+    
     return {"job_id": job_id}
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
+    """Get job status"""
     meta = await job_read(job_id)
     if not meta:
         return {"status": "not_found"}
-    allowed = {k: meta.get(k) for k in ["status","message","progress","created_at","updated_at"]}
+    
+    allowed = {k: meta.get(k) for k in ["status", "message", "progress", "created_at", "updated_at"]}
     return allowed
 
 @app.get("/api/jobs/{job_id}/result")
 async def get_result(job_id: str):
+    """Download job result XLSX"""
     meta = await job_read(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Not found")
     if meta.get("status") != "completed":
         raise HTTPException(status_code=409, detail="Job not completed")
+    
     blob = await job_get_file(job_id)
     if not blob:
         raise HTTPException(status_code=410, detail="Result expired")
+    
     filename = meta.get("filename") or "leads.xlsx"
     return StreamingResponse(
         io.BytesIO(blob),
@@ -465,31 +538,43 @@ async def get_result(job_id: str):
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    """Health check endpoint"""
+    try:
+        await redis.ping()
+        return {"status": "ok", "redis": "connected"}
+    except Exception as e:
+        return {"status": "degraded", "redis": "disconnected", "error": str(e)}
 
 # -------- Job runner --------
 async def run_job(job_id: str):
+    """Background job processor"""
     if not await job_claim_lock(job_id):
         return
+    
     try:
         await job_update(job_id, {"status": "running", "progress": "5", "updated_at": str(now_ms())})
         data = await job_read(job_id)
         category = data.get("category", "")
         include_amazon_check = data.get("include_amazon_check", "false") == "true"
 
+        # Step 1: Discover leads
         leads = await discover_leads(category)
         await job_update(job_id, {"progress": "25", "updated_at": str(now_ms())})
 
+        # Step 2: Deduplicate
         deduped = dedupe_by_root_domain(leads)
         await job_update(job_id, {"progress": "45", "updated_at": str(now_ms())})
 
+        # Step 3: Refine Shopify detection
         await refine_shopify_detection(deduped)
         await job_update(job_id, {"progress": "70", "updated_at": str(now_ms())})
 
+        # Step 4: Amazon presence check (if requested)
         if include_amazon_check:
             await enrich_amazon_presence(deduped)
         await job_update(job_id, {"progress": "85", "updated_at": str(now_ms())})
 
+        # Step 5: Generate XLSX
         buffer = leads_to_xlsx_bytes(deduped[:TARGET_LEADS_MAX])
         await job_set_file(job_id, buffer)
 
@@ -500,16 +585,21 @@ async def run_job(job_id: str):
             "updated_at": str(now_ms())
         })
     except Exception as e:
-        await job_update(job_id, {"status": "failed", "message": str(e), "updated_at": str(now_ms())})
+        await job_update(job_id, {
+            "status": "failed",
+            "message": str(e),
+            "updated_at": str(now_ms())
+        })
     finally:
         await job_release_lock(job_id)
 
-# -------- Static files (mounted after all API routes) --------
+# -------- Static files --------
 public_dir = os.path.join(os.path.dirname(__file__), "public")
 
 @app.get("/")
 async def serve_index():
+    """Serve the frontend"""
     return FileResponse(os.path.join(public_dir, "index.html"))
 
-# Serve any additional static assets under /static
+# Mount static assets at /static
 app.mount("/static", StaticFiles(directory=public_dir, html=False), name="static")
