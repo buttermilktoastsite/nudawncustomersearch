@@ -62,14 +62,25 @@ app.add_middleware(
 )
 
 # -------- Redis --------
-import ssl
+from urllib.parse import urlparse as parse_redis_url
 
-redis = aioredis.StrictRedis.from_url(
-    REDIS_URL,
+# Parse Redis URL manually for better control
+parsed = parse_redis_url(REDIS_URL)
+redis_host = parsed.hostname
+redis_port = parsed.port or 6379
+redis_password = parsed.password
+redis_username = parsed.username or "default"
+
+redis = aioredis.StrictRedis(
+    host=redis_host,
+    port=redis_port,
+    username=redis_username,
+    password=redis_password,
     decode_responses=False,
     socket_timeout=15,
     socket_connect_timeout=15,
-    ssl_cert_reqs=ssl.CERT_NONE if REDIS_URL.startswith("rediss://") else None,
+    retry_on_timeout=True,
+    health_check_interval=30,
 )
 
 # -------- Key helpers --------
@@ -599,5 +610,6 @@ async def serve_index():
 
 # Mount static assets at /static
 app.mount("/static", StaticFiles(directory=public_dir, html=False), name="static")
+
 
 
