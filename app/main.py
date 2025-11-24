@@ -178,7 +178,8 @@ def is_marketplace_url(url: str) -> bool:
     if not host:
         return False
     bad_roots = ("amazon.", "walmart.", "target.", "etsy.", "ebay.")
-    return host.startswith(bad_roots) or any(f".{b}" in host for b in bad_roots)
+    # Only exclude clear marketplace hosts
+    return any(host.startswith(b) or host.endswith(b[:-1]) for b in bad_roots)
 
 # -------- Shopify detection (heuristic + precise) --------
 def looks_like_shopify_heuristic(url: str, snippet: str = "") -> bool:
@@ -352,6 +353,7 @@ async def search_serpapi(query: str, page: int) -> List[Tuple[str, str, str]]:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             r = await client.get(url, params=params, headers=headers)
             if r.status_code != 200:
+                print(f"[SerpAPI] Error: status {r.status_code}")
                 return out
             data = r.json()
             for item in (data.get("organic_results") or []):
@@ -360,8 +362,8 @@ async def search_serpapi(query: str, page: int) -> List[Tuple[str, str, str]]:
                 snippet = (item.get("snippet") or "").strip()
                 if link:
                     out.append((link, title, snippet))
-    except:
-        pass
+    except Exception as e:
+        print(f"[SerpAPI] Exception: {e}")
     return out
 
 async def search_duckduckgo(query: str, page: int) -> List[Tuple[str, str, str]]:
@@ -409,15 +411,14 @@ async def search_duckduckgo(query: str, page: int) -> List[Tuple[str, str, str]]
 def build_queries(category: str) -> List[str]:
     """Build search queries for lead discovery"""
     base = category.strip()
-    q = [
-        f'"powered by shopify" "{base}"',
-        f'"cdn.shopify.com" "{base}"',
-        f'"{base}" "/products/" -amazon -walmart -target -etsy -ebay',
-        f'"{base}" "/collections/" -amazon -walmart -target -etsy -ebay',
-        f'"{base}" "add to cart" product -amazon -walmart -target -etsy -ebay',
-        f'"{base}" "shop" "official site" -amazon -walmart -target -etsy -ebay',
+    return [
+        f'"{base}" "buy" "online"',
+        f'"{base}" "add to cart"',
+        f'"{base}" "shop" -amazon -walmart -target -etsy -ebay',
+        f'"{base}" "official site"',
+        f'"{base}" "store" -amazon -walmart -target -etsy -ebay',
+        f'"{base}" "products" -amazon -walmart -target -etsy -ebay',
     ]
-    return q
 
 async def discover_leads(category: str) -> List[Dict[str, str]]:
     """Discover leads via search engines"""
@@ -427,6 +428,7 @@ async def discover_leads(category: str) -> List[Dict[str, str]]:
     sem = asyncio.Semaphore(SEARCH_CONCURRENCY)
 
     use_serpapi = (SEARCH_ENGINE == "serpapi") or (SEARCH_ENGINE == "auto" and SERPAPI_KEY)
+    print(f"[Discovery] Using SerpAPI: {use_serpapi}, SERPAPI_KEY present: {bool(SERPAPI_KEY)}")
     
     async def do_search(query: str, page: int) -> List[Tuple[str, str, str]]:
         if use_serpapi:
@@ -439,7 +441,9 @@ async def discover_leads(category: str) -> List[Dict[str, str]]:
         for page in range(1, SEARCH_PAGES_PER_QUERY + 1):
             async with sem:
                 try:
+                    print(f"[Discovery] Query='{q}', page={page}")
                     results = await do_search(q, page)
+                    print(f"[Discovery] Got {len(results)} raw results for query='{q}', page={page}")
                     for url, title, snippet in results:
                         if is_marketplace_url(url):
                             continue
@@ -447,6 +451,9 @@ async def discover_leads(category: str) -> List[Dict[str, str]]:
                         # Get parent URL (root domain)
                         parent_url = get_parent_url(url)
                         domain = get_hostname(parent_url)
+                        
+                        if not domain:
+                            continue
                         
                         # Skip if we've already seen this domain
                         if domain in seen_domains:
@@ -472,15 +479,15 @@ async def discover_leads(category: str) -> List[Dict[str, str]]:
                         if len(leads) >= TARGET_LEADS_MAX:
                             return
                 except Exception as e:
-                    print(f"Search error: {e}")
-                    pass
+                    print(f"[Discovery] Search error for query='{q}', page={page}: {e}")
             if len(leads) >= TARGET_LEADS_MAX:
                 return
 
     tasks = [fetch_query(q) for q in queries]
     await asyncio.gather(*tasks)
 
-    return leads[:max(TARGET_LEADS_MIN, min(TARGET_LEADS_MAX, len(leads)))]
+    # Return up to TARGET_LEADS_MAX, even if there are fewer
+    return leads[:TARGET_LEADS_MAX]
 
 def dedupe_by_root_domain(leads: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """Deduplicate leads by domain (already using parent URLs)"""
