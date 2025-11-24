@@ -22,18 +22,18 @@ from redis import asyncio as aioredis
 
 # -------- Configuration --------
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
-AMAZON_CHECK_CONCURRENCY = int(os.getenv("AMAZON_CHECK_CONCURRENCY", "4"))
-AMAZON_CHECK_DELAY_MS = int(os.getenv("AMAZON_CHECK_DELAY_MS", "250"))
 REDIS_URL = os.getenv("REDIS_URL")
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", "3600"))
 
 # Discovery tuning
 SEARCH_CONCURRENCY = int(os.getenv("SEARCH_CONCURRENCY", "4"))
 SEARCH_PAGES_PER_QUERY = int(os.getenv("SEARCH_PAGES_PER_QUERY", "3"))
-TARGET_LEADS_MIN = int(os.getenv("TARGET_LEADS_MIN", "50"))
-TARGET_LEADS_MAX = int(os.getenv("TARGET_LEADS_MAX", "100"))
+TARGET_LEADS_MAX = int(os.getenv("TARGET_LEADS_MAX", "100"))  # hard cap, will also enforce 100 below
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "15.0"))
-USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (compatible; LeadFinderBot/1.3; +https://example.com/bot)")
+USER_AGENT = os.getenv(
+    "USER_AGENT",
+    "Mozilla/5.0 (compatible; LeadFinderBot/1.3; +https://example.com/bot)"
+)
 
 # Search engine selection
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
@@ -127,12 +127,9 @@ def get_brand_from_url(url: str) -> str:
     """Extract brand/company name from URL"""
     try:
         hostname = get_hostname(url).replace("www.", "")
-        # Remove TLD (.com, .co.uk, etc.)
         parts = hostname.split(".")
         if len(parts) >= 2:
-            # Take the main domain part (e.g., "kilimanjarogear" from "kilimanjarogear.com")
             brand = parts[-2]
-            # Capitalize first letter
             return brand.capitalize()
         return hostname
     except:
@@ -143,31 +140,19 @@ def extract_brand_from_title(title: str) -> str:
     if not title:
         return ""
     
-    # Common patterns in titles:
-    # "Product Name | Brand Name"
-    # "Product Name - Brand Name"
-    # "Brand Name: Product Name"
-    # "Product Name – Brand Name"
-    
-    # Try splitting by common separators
     for sep in [" | ", " - ", " – ", " — ", ":"]:
         if sep in title:
             parts = title.split(sep)
-            # Usually brand is the last part or second-to-last
             if len(parts) >= 2:
-                # Take the last part, clean it up
                 brand = parts[-1].strip()
-                # Remove common suffixes
                 for suffix in ["Shop", "Store", "Official Site", "Official Store", "Online Store"]:
                     if brand.endswith(suffix):
                         brand = brand[:-len(suffix)].strip()
                 if brand and len(brand) > 2:
                     return brand
     
-    # If no separator, take first few words (likely brand)
     words = title.split()
     if len(words) > 0:
-        # Take first 1-3 words as potential brand
         return " ".join(words[:min(3, len(words))])
     
     return ""
@@ -178,7 +163,6 @@ def is_marketplace_url(url: str) -> bool:
     if not host:
         return False
     bad_roots = ("amazon.", "walmart.", "target.", "etsy.", "ebay.")
-    # Only exclude clear marketplace hosts
     return any(host.startswith(b) or host.endswith(b[:-1]) for b in bad_roots)
 
 # -------- Shopify detection (heuristic + precise) --------
@@ -253,8 +237,6 @@ async def fetch_brand_from_homepage(url: str) -> Optional[str]:
             
             soup = BeautifulSoup(r.text, "html.parser")
             
-            # Try to find brand in common places
-            # 1. Site title
             title_tag = soup.find("title")
             if title_tag:
                 title = title_tag.get_text(strip=True)
@@ -262,12 +244,10 @@ async def fetch_brand_from_homepage(url: str) -> Optional[str]:
                 if brand:
                     return brand
             
-            # 2. Meta og:site_name
             og_site = soup.find("meta", property="og:site_name")
             if og_site and og_site.get("content"):
                 return og_site["content"].strip()
             
-            # 3. Logo alt text
             logo = soup.find("img", class_=lambda x: x and "logo" in x.lower())
             if logo and logo.get("alt"):
                 return logo["alt"].strip()
@@ -288,50 +268,25 @@ async def precise_shopify_check(base_url: str) -> Optional[bool]:
     
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers=headers) as client:
-            # Check robots.txt
             robots = await fetch_text(client, urljoin(base, "robots.txt"))
             if robots and ("shopify" in robots.lower()):
                 return True
 
-            # Check homepage HTML
             home_html = await fetch_text(client, base)
             if home_html is not None and detect_shopify_from_html(home_html):
                 return True
 
-            # Check theme assets
             for asset in ("assets/theme.js", "assets/theme.css"):
                 txt = await fetch_text(client, urljoin(base, asset), method="HEAD")
                 if txt is not None:
                     return True
 
-            # If we got homepage but no Shopify markers, it's likely not Shopify
             if home_html is not None:
                 return False
             
             return None
     except:
         return None
-
-# -------- Amazon presence check --------
-async def check_amazon_presence(brand: str) -> str:
-    """Check if brand appears on Amazon search"""
-    q = brand
-    url = f"https://www.amazon.com/s?k={q}"
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            r = await client.get(url, headers=headers)
-            if r.status_code != 200:
-                return "No"
-            txt = r.text.lower()
-            if "results for" in txt or "s-result" in txt:
-                return "Possibly Yes"
-            return "No"
-    except:
-        return "Unknown"
 
 # -------- Discovery via SerpAPI or DuckDuckGo --------
 async def search_serpapi(query: str, page: int) -> List[Tuple[str, str, str]]:
@@ -379,7 +334,6 @@ async def search_duckduckgo(query: str, page: int) -> List[Tuple[str, str, str]]
     }
     results: List[Tuple[str, str, str]] = []
     
-    # Retry up to 3 times with backoff
     for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
@@ -398,9 +352,8 @@ async def search_duckduckgo(query: str, page: int) -> List[Tuple[str, str, str]]
                             results.append((href, title, snippet))
                     if results:
                         return results
-                # If we got rate limited or blocked, wait and retry
                 if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)  # 1s, 2s backoff
+                    await asyncio.sleep(2 ** attempt)
         except Exception as e:
             print(f"DuckDuckGo search error (attempt {attempt + 1}): {e}")
             if attempt < 2:
@@ -424,7 +377,7 @@ async def discover_leads(category: str) -> List[Dict[str, str]]:
     """Discover leads via search engines"""
     queries = build_queries(category)
     leads: List[Dict[str, str]] = []
-    seen_domains = set()  # Track by domain instead of full URL
+    seen_domains = set()
     sem = asyncio.Semaphore(SEARCH_CONCURRENCY)
 
     use_serpapi = (SEARCH_ENGINE == "serpapi") or (SEARCH_ENGINE == "auto" and SERPAPI_KEY)
@@ -448,22 +401,15 @@ async def discover_leads(category: str) -> List[Dict[str, str]]:
                         if is_marketplace_url(url):
                             continue
                         
-                        # Get parent URL (root domain)
                         parent_url = get_parent_url(url)
                         domain = get_hostname(parent_url)
-                        
                         if not domain:
                             continue
-                        
-                        # Skip if we've already seen this domain
                         if domain in seen_domains:
                             continue
                         seen_domains.add(domain)
                         
-                        # Extract brand name from title first
                         brand = extract_brand_from_title(title)
-                        
-                        # Fallback to URL-based brand extraction
                         if not brand or len(brand) < 3:
                             brand = get_brand_from_url(parent_url)
                         
@@ -473,21 +419,20 @@ async def discover_leads(category: str) -> List[Dict[str, str]]:
                             "Brand Name": brand,
                             "URL": parent_url,
                             "Is this a Shopify site?": shopify_guess,
-                            "Already selling on Amazon?": "Unknown",
                         })
                         
-                        if len(leads) >= TARGET_LEADS_MAX:
+                        if len(leads) >= TARGET_LEADS_MAX * 3:
+                            # allow some extra before filtering
                             return
                 except Exception as e:
                     print(f"[Discovery] Search error for query='{q}', page={page}: {e}")
-            if len(leads) >= TARGET_LEADS_MAX:
+            if len(leads) >= TARGET_LEADS_MAX * 3:
                 return
 
     tasks = [fetch_query(q) for q in queries]
     await asyncio.gather(*tasks)
 
-    # Return up to TARGET_LEADS_MAX, even if there are fewer
-    return leads[:TARGET_LEADS_MAX]
+    return leads
 
 def dedupe_by_root_domain(leads: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """Deduplicate leads by domain (already using parent URLs)"""
@@ -504,6 +449,10 @@ def dedupe_by_root_domain(leads: List[Dict[str, str]]) -> List[Dict[str, str]]:
         out.append(lead)
     return out
 
+def filter_only_shopify(leads: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Keep only leads that are confirmed Shopify sites."""
+    return [l for l in leads if l.get("Is this a Shopify site?") == "Yes"]
+
 def leads_to_xlsx_bytes(leads: List[Dict[str, str]]) -> bytes:
     """Convert leads to XLSX bytes"""
     wb = openpyxl.Workbook()
@@ -513,7 +462,6 @@ def leads_to_xlsx_bytes(leads: List[Dict[str, str]]) -> bytes:
         "Brand Name",
         "URL",
         "Is this a Shopify site?",
-        "Already selling on Amazon?"
     ]
     ws.append(headers)
     for row in leads:
@@ -521,9 +469,7 @@ def leads_to_xlsx_bytes(leads: List[Dict[str, str]]) -> bytes:
             row.get("Brand Name") or "",
             row.get("URL") or "",
             row.get("Is this a Shopify site?") or "",
-            row.get("Already selling on Amazon?") or "Unknown",
         ])
-    # Bold headers
     for cell in ws[1]:
         cell.font = openpyxl.styles.Font(bold=True)
     
@@ -539,7 +485,6 @@ async def refine_brand_names(leads: List[Dict[str, str]]) -> List[Dict[str, str]
         url = lead.get("URL") or ""
         current_brand = lead.get("Brand Name") or ""
         
-        # Only refine if current brand looks like a domain name (no spaces)
         if current_brand and " " not in current_brand:
             async with sem:
                 better_brand = await fetch_brand_from_homepage(url)
@@ -568,49 +513,28 @@ async def refine_shopify_detection(leads: List[Dict[str, str]]) -> List[Dict[str
     await asyncio.gather(*(check_one(l) for l in leads), return_exceptions=True)
     return leads
 
-async def enrich_amazon_presence(leads: List[Dict[str, str]]):
-    """Enrich leads with Amazon presence check"""
-    sem = asyncio.Semaphore(AMAZON_CHECK_CONCURRENCY)
-    
-    async def check_one(lead):
-        brand = (lead.get("Brand Name") or "").strip()
-        if not brand:
-            brand = get_brand_from_url(lead.get("URL") or "")
-        async with sem:
-            lead["Already selling on Amazon?"] = await check_amazon_presence(brand)
-            await sleep_ms(AMAZON_CHECK_DELAY_MS)
-    
-    await asyncio.gather(*(check_one(l) for l in leads), return_exceptions=True)
-    return leads
-
 # -------- Redis helpers --------
 async def job_update(job_id: str, mapping: Dict[str, str]):
-    """Update job metadata in Redis"""
     bmap = {k.encode(): v.encode() for k, v in mapping.items()}
     await redis.hset(k_job(job_id), mapping=bmap)
     await redis.expire(k_job(job_id), JOB_TTL_SECONDS)
 
 async def job_read(job_id: str) -> Dict[str, str]:
-    """Read job metadata from Redis"""
     data = await redis.hgetall(k_job(job_id))
     if not data:
         return {}
     return {k.decode(): v.decode() for k, v in data.items()}
 
 async def job_set_file(job_id: str, blob: bytes):
-    """Store job result file in Redis"""
     await redis.set(k_job_file(job_id), blob, ex=JOB_TTL_SECONDS)
 
 async def job_get_file(job_id: str) -> Optional[bytes]:
-    """Retrieve job result file from Redis"""
     return await redis.get(k_job_file(job_id))
 
 async def job_claim_lock(job_id: str, ttl: int = 240) -> bool:
-    """Claim a lock for job processing"""
     return await redis.set(k_job_lock(job_id), b"1", ex=ttl, nx=True) is True
 
 async def job_release_lock(job_id: str):
-    """Release job processing lock"""
     try:
         await redis.delete(k_job_lock(job_id))
     except:
@@ -620,10 +544,8 @@ async def job_release_lock(job_id: str):
 @app.post("/api/jobs")
 @limiter.limit("20/minute")
 async def create_job(request: Request):
-    """Create a new lead discovery job"""
     data = await request.json()
     category = (data.get("category") or "").strip()
-    include = bool(data.get("include_amazon_check"))
     
     if not category:
         raise HTTPException(status_code=400, detail="Missing category")
@@ -635,17 +557,14 @@ async def create_job(request: Request):
         "created_at": str(now_ms()),
         "updated_at": str(now_ms()),
         "category": category,
-        "include_amazon_check": "true" if include else "false"
     })
     
-    # Start job processing in background
     asyncio.create_task(run_job(job_id))
     
     return {"job_id": job_id}
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
-    """Get job status"""
     meta = await job_read(job_id)
     if not meta:
         return {"status": "not_found"}
@@ -655,7 +574,6 @@ async def get_job(job_id: str):
 
 @app.get("/api/jobs/{job_id}/result")
 async def get_result(job_id: str):
-    """Download job result XLSX"""
     meta = await job_read(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Not found")
@@ -670,12 +588,11 @@ async def get_result(job_id: str):
     return StreamingResponse(
         io.BytesIO(blob),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'}
     )
 
 @app.get("/healthz")
 async def healthz():
-    """Health check endpoint"""
     try:
         await redis.ping()
         return {"status": "ok", "redis": "connected"}
@@ -684,7 +601,6 @@ async def healthz():
 
 # -------- Job runner --------
 async def run_job(job_id: str):
-    """Background job processor"""
     if not await job_claim_lock(job_id):
         return
     
@@ -692,7 +608,6 @@ async def run_job(job_id: str):
         await job_update(job_id, {"status": "running", "progress": "5", "updated_at": str(now_ms())})
         data = await job_read(job_id)
         category = data.get("category", "")
-        include_amazon_check = data.get("include_amazon_check", "false") == "true"
 
         # Step 1: Discover leads
         print(f"[Job {job_id}] Starting discovery for category: {category}")
@@ -704,11 +619,10 @@ async def run_job(job_id: str):
             await job_update(job_id, {
                 "status": "completed",
                 "progress": "100",
-                "message": "No leads found. Try using SERPAPI_KEY for better results.",
+                "message": "No leads found. Try adjusting the category or using SERPAPI_KEY.",
                 "filename": f"leads_{category.replace(' ', '_')}.xlsx",
                 "updated_at": str(now_ms())
             })
-            # Still create empty file
             buffer = leads_to_xlsx_bytes([])
             await job_set_file(job_id, buffer)
             return
@@ -716,25 +630,37 @@ async def run_job(job_id: str):
         # Step 2: Deduplicate
         deduped = dedupe_by_root_domain(leads)
         print(f"[Job {job_id}] After deduplication: {len(deduped)} leads")
-        await job_update(job_id, {"progress": "35", "updated_at": str(now_ms())})
+        await job_update(job_id, {"progress": "40", "updated_at": str(now_ms())})
 
-        # Step 2.5: Refine brand names
+        # Step 3: Refine brand names
         await refine_brand_names(deduped)
-        await job_update(job_id, {"progress": "45", "updated_at": str(now_ms())})
+        await job_update(job_id, {"progress": "55", "updated_at": str(now_ms())})
 
-        # Step 3: Refine Shopify detection
+        # Step 4: Refine Shopify detection
         await refine_shopify_detection(deduped)
-        await job_update(job_id, {"progress": "70", "updated_at": str(now_ms())})
+        await job_update(job_id, {"progress": "75", "updated_at": str(now_ms())})
 
-        # Step 4: Amazon presence check (if requested)
-        if include_amazon_check:
-            await enrich_amazon_presence(deduped)
-        await job_update(job_id, {"progress": "85", "updated_at": str(now_ms())})
+        # Step 5: Filter only confirmed Shopify and cap to 100
+        shopify_only = filter_only_shopify(deduped)
+        print(f"[Job {job_id}] After Shopify filter: {len(shopify_only)} leads")
 
-        # Step 5: Generate XLSX
-        buffer = leads_to_xlsx_bytes(deduped[:TARGET_LEADS_MAX])
+        if not shopify_only:
+            await job_update(job_id, {
+                "status": "completed",
+                "progress": "100",
+                "message": "No confirmed Shopify stores found for this category.",
+                "filename": f"leads_{category.replace(' ', '_')}.xlsx",
+                "updated_at": str(now_ms())
+            })
+            buffer = leads_to_xlsx_bytes([])
+            await job_set_file(job_id, buffer)
+            return
+
+        MAX_RESULTS = 100
+        final_leads = shopify_only[:MAX_RESULTS]
+        buffer = leads_to_xlsx_bytes(final_leads)
         await job_set_file(job_id, buffer)
-        print(f"[Job {job_id}] Generated XLSX with {len(deduped)} leads")
+        print(f"[Job {job_id}] Generated XLSX with {len(final_leads)} Shopify leads")
 
         await job_update(job_id, {
             "status": "completed",
@@ -759,8 +685,6 @@ public_dir = os.path.join(os.path.dirname(__file__), "public")
 
 @app.get("/")
 async def serve_index():
-    """Serve the frontend"""
     return FileResponse(os.path.join(public_dir, "index.html"))
 
-# Mount static assets at /static
 app.mount("/static", StaticFiles(directory=public_dir, html=False), name="static")
