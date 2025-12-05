@@ -28,7 +28,7 @@ JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", "3600"))
 # Discovery tuning
 SEARCH_CONCURRENCY = int(os.getenv("SEARCH_CONCURRENCY", "4"))
 SEARCH_PAGES_PER_QUERY = int(os.getenv("SEARCH_PAGES_PER_QUERY", "3"))
-TARGET_LEADS_MAX = int(os.getenv("TARGET_LEADS_MAX", "100"))  # hard cap, will also enforce 100 below
+TARGET_LEADS_MAX = int(os.getenv("TARGET_LEADS_MAX", "100"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "15.0"))
 USER_AGENT = os.getenv(
     "USER_AGENT",
@@ -36,7 +36,7 @@ USER_AGENT = os.getenv(
 )
 
 # Search engine selection
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+SERPSTACK_KEY = os.getenv("SERPSTACK_KEY")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "auto").lower()
 
 # Shopify detection concurrency
@@ -288,19 +288,18 @@ async def precise_shopify_check(base_url: str) -> Optional[bool]:
     except:
         return None
 
-# -------- Discovery via SerpAPI or DuckDuckGo --------
-async def search_serpapi(query: str, page: int) -> List[Tuple[str, str, str]]:
-    """Search using SerpAPI"""
-    start = (page - 1) * 10
-    url = "https://serpapi.com/search.json"
+# -------- Discovery via SerpStack or DuckDuckGo --------
+async def search_serpstack(query: str, page: int) -> List[Tuple[str, str, str]]:
+    """Search using SerpStack"""
+    offset = (page - 1) * 10
+    url = "http://api.serpstack.com/search"
     params = {
-        "engine": "google",
-        "q": query,
-        "hl": "en",
-        "gl": "us",
+        "access_key": SERPSTACK_KEY,
+        "query": query,
         "num": "10",
-        "start": str(start),
-        "api_key": SERPAPI_KEY,
+        "offset": str(offset),
+        "gl": "us",
+        "hl": "en",
     }
     headers = {"User-Agent": USER_AGENT}
     out: List[Tuple[str, str, str]] = []
@@ -308,17 +307,23 @@ async def search_serpapi(query: str, page: int) -> List[Tuple[str, str, str]]:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             r = await client.get(url, params=params, headers=headers)
             if r.status_code != 200:
-                print(f"[SerpAPI] Error: status {r.status_code}")
+                print(f"[SerpStack] Error: status {r.status_code}")
                 return out
             data = r.json()
+            
+            # Check for API errors
+            if "error" in data:
+                print(f"[SerpStack] API Error: {data['error']}")
+                return out
+            
             for item in (data.get("organic_results") or []):
-                link = item.get("link") or ""
+                link = item.get("url") or ""
                 title = (item.get("title") or "").strip()
                 snippet = (item.get("snippet") or "").strip()
                 if link:
                     out.append((link, title, snippet))
     except Exception as e:
-        print(f"[SerpAPI] Exception: {e}")
+        print(f"[SerpStack] Exception: {e}")
     return out
 
 async def search_duckduckgo(query: str, page: int) -> List[Tuple[str, str, str]]:
@@ -380,12 +385,12 @@ async def discover_leads(category: str) -> List[Dict[str, str]]:
     seen_domains = set()
     sem = asyncio.Semaphore(SEARCH_CONCURRENCY)
 
-    use_serpapi = (SEARCH_ENGINE == "serpapi") or (SEARCH_ENGINE == "auto" and SERPAPI_KEY)
-    print(f"[Discovery] Using SerpAPI: {use_serpapi}, SERPAPI_KEY present: {bool(SERPAPI_KEY)}")
+    use_serpstack = (SEARCH_ENGINE == "serpstack") or (SEARCH_ENGINE == "auto" and SERPSTACK_KEY)
+    print(f"[Discovery] Using SerpStack: {use_serpstack}, SERPSTACK_KEY present: {bool(SERPSTACK_KEY)}")
     
     async def do_search(query: str, page: int) -> List[Tuple[str, str, str]]:
-        if use_serpapi:
-            return await search_serpapi(query, page)
+        if use_serpstack:
+            return await search_serpstack(query, page)
         else:
             return await search_duckduckgo(query, page)
 
@@ -619,7 +624,7 @@ async def run_job(job_id: str):
             await job_update(job_id, {
                 "status": "completed",
                 "progress": "100",
-                "message": "No leads found. Try adjusting the category or using SERPAPI_KEY.",
+                "message": "No leads found. Try adjusting the category or using SERPSTACK_KEY.",
                 "filename": f"leads_{category.replace(' ', '_')}.xlsx",
                 "updated_at": str(now_ms())
             })
