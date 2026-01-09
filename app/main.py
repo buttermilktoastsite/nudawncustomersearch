@@ -28,7 +28,7 @@ JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", "3600"))
 # Discovery tuning
 SEARCH_CONCURRENCY = int(os.getenv("SEARCH_CONCURRENCY", "4"))
 SEARCH_PAGES_PER_QUERY = int(os.getenv("SEARCH_PAGES_PER_QUERY", "3"))
-TARGET_LEADS_MAX = int(os.getenv("TARGET_LEADS_MAX", "100"))
+TARGET_LEADS_MAX = int(os.getenv("TARGET_LEADS_MAX", "350"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "15.0"))
 USER_AGENT = os.getenv(
     "USER_AGENT",
@@ -693,3 +693,4 @@ async def serve_index():
     return FileResponse(os.path.join(public_dir, "index.html"))
 
 app.mount("/static", StaticFiles(directory=public_dir, html=False), name="static")
+
